@@ -131,17 +131,19 @@ struct Header {
     archives: Vec<ArchiveInfo>,
 }
 
-struct RRD {
-    path: &'static str,
+struct RRD<'a> {
+    path: Cow<'a, str>,
 }
 
-impl RRD {
-    fn new(path: &'static str) -> RRD {
-        RRD { path: path }
+impl<'a> RRD<'a> {
+    fn new<S>(path: S) -> RRD<'a>
+        where S: Into<Cow<'a, str>>
+    {
+        RRD { path: path.into() }
     }
 
     fn init_file(self, archives: &[ArchiveSpec], method: Aggregation) -> Result<(), Error> {
-        let mut fd = File::create(self.path)?;
+        let mut fd = File::create(self.path.as_ref())?;
 
         let mut total_size: u64 = 0;
         let meta_size: usize;
@@ -185,7 +187,7 @@ impl RRD {
     }
 
     fn read_header(&self) -> Result<Header, Error> {
-        let mut fd = File::open(self.path)?;
+        let mut fd = File::open(self.path.as_ref())?;
         let meta: Meta = unsafe { from_bytes(&mut fd) };
         let mut archives: Vec<ArchiveInfo> = Vec::with_capacity(meta.num_of_archives as usize);
 
@@ -204,7 +206,7 @@ impl RRD {
         let mut fd = OpenOptions::new().write(true)
             .read(true)
             .create(false)
-            .open(self.path)?;
+            .open(self.path.as_ref())?;
 
         let header = self.read_header()?;
 
