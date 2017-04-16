@@ -1,5 +1,5 @@
 mod rrd;
-mod tsmap;
+mod ts;
 
 use rrd::{RRD, ArchiveSpec, Aggregation};
 
