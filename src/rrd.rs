@@ -155,13 +155,12 @@ impl<'a> RRD<'a> {
         fd.flush().map_err(|e| RRDError::Io(e))
     }
 
-    fn read_header(&self) -> Result<Header, RRDError> {
-        let mut fd = File::open(self.path.as_ref())?;
-        let meta: Meta = unsafe { from_bytes(&mut fd) };
+    fn read_header(&self, fd: &mut File) -> Result<Header, RRDError> {
+        let meta: Meta = unsafe { from_bytes(fd) };
         let mut archives: Vec<ArchiveInfo> = Vec::with_capacity(meta.num_of_archives as usize);
 
         for _ in 0..meta.num_of_archives {
-            let archive: ArchiveInfo = unsafe { from_bytes(&mut fd) };
+            let archive: ArchiveInfo = unsafe { from_bytes(fd) };
             archives.push(archive);
         }
 
@@ -172,17 +171,25 @@ impl<'a> RRD<'a> {
     }
 
     fn add_point(&mut self, dp: DataPoint) -> Result<(), RRDError> {
+        // refuse to add the datapoint if it's in the future
         let now = unix_time();
         if dp.time > now {
             return Err(RRDError::InvalidDataPoint(dp));
         }
 
-        let header = self.read_header()?;
+        // find all archives which covers the datapoint
+        let mut fd = OpenOptions::new().write(true)
+            .read(true)
+            .create(false)
+            .open(self.path.as_ref())?;
+
+        let header = self.read_header(&mut fd)?;
         let delta = now - dp.time;
         let mut related_archives = header.archives
             .iter()
             .filter(|e| e.secs_per_point * e.num_of_points > delta as u32);
 
+        // archives are sorted, the fist has highest precision
         let mut high = related_archives.next();
         if high.is_none() {
             return Ok(());
@@ -190,32 +197,30 @@ impl<'a> RRD<'a> {
 
         let archive = high.unwrap();
 
-        let mut fd = OpenOptions::new().write(true)
-            .read(true)
-            .create(false)
-            .open(self.path.as_ref())?;
 
         fd.seek(SeekFrom::Start(archive.offset as u64))?;
-        let last: DataPoint = unsafe { from_bytes(&mut fd) };
+        let first: DataPoint = unsafe { from_bytes(&mut fd) };
 
-        let current = DataPoint {
+
+        // align dp's time
+        let dp = DataPoint {
             time: dp.time - (dp.time % archive.secs_per_point as u64),
             value: dp.value,
         };
 
         // this is the fist datapoint
-        if last.time == 0 {
-            let bytes = unsafe { as_bytes(&current) };
+        if first.time == 0 {
+            let bytes = unsafe { as_bytes(&dp) };
 
             fd.seek(SeekFrom::Start(archive.offset as u64))?;
             fd.write(bytes)?;
         } else {
-            let skiped_num = (current.time - last.time) / archive.secs_per_point as u64;
+            let skiped_num = (dp.time - first.time) / archive.secs_per_point as u64;
             let skiped_offset = skiped_num * mem::size_of::<DataPoint>() as u64;
             let new_offset = archive.offset as u64 +
                              skiped_offset as u64 %
                              (archive.num_of_points as u64 * mem::size_of::<DataPoint>() as u64);
-            let bytes = unsafe { as_bytes(&current) };
+            let bytes = unsafe { as_bytes(&dp) };
 
             fd.seek(SeekFrom::Start(new_offset as u64))?;
             fd.write(bytes)?;
@@ -249,18 +254,10 @@ fn test_read_write_file() {
                                Aggregation::Avg);
     assert!(result.is_ok());
 
-    let rrd = RRD::new("/tmp/example.rrd");
-    let result = rrd.read_header();
-    assert!(result.is_ok());
-    let header = result.unwrap();
-    assert_eq!(header.meta.num_of_archives, 1);
-    assert_eq!(header.archives.len(), 1);
-
-
     let mut rrd = RRD::new("/tmp/example.rrd");
-    for i in 0..60 * 48 {
+    for i in 0..60 {
         let result = rrd.add_point(DataPoint {
-            time: unix_time() + i * 60,
+            time: unix_time() - i * 60,
             value: 12.3,
         });
         assert!(result.is_ok());
