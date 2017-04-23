@@ -1,5 +1,4 @@
 mod rrd;
-mod ts;
 
 use rrd::{RRD, ArchiveSpec, Aggregation};
 

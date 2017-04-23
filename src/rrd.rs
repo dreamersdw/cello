@@ -3,6 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Error, Seek, SeekFrom};
 use std::iter::Iterator;
 use std::mem;
+use std::fmt;
+use std::error;
 use std::slice;
 use std::time;
 
@@ -10,6 +12,12 @@ use std::time;
 pub struct DataPoint {
     pub time: u64,
     pub value: f64,
+}
+
+impl fmt::Display for DataPoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Debug)]
@@ -54,6 +62,44 @@ struct Header {
     archives: Vec<ArchiveInfo>,
 }
 
+#[derive(Debug)]
+enum RRDError {
+    Io(Error),
+    InvalidDataPoint(DataPoint),
+}
+
+impl fmt::Display for RRDError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            RRDError::Io(ref err) => write!(f, "IO error: {}", err),
+            RRDError::InvalidDataPoint(ref err) => write!(f, "Invalid datapoint: {}", err),
+        }
+    }
+}
+
+impl error::Error for RRDError {
+    fn description(&self) -> &str {
+        match *self {
+            RRDError::Io(ref err) => err.description(),
+            RRDError::InvalidDataPoint(_) => "Invalid datapoint",
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        match *self {
+            RRDError::Io(ref err) => Some(err),
+            RRDError::InvalidDataPoint(_) => None,
+        }
+    }
+}
+
+impl From<Error> for RRDError {
+    fn from(err: Error) -> RRDError {
+        RRDError::Io(err)
+    }
+}
+
+
 pub struct RRD<'a> {
     path: Cow<'a, str>,
 }
@@ -65,7 +111,7 @@ impl<'a> RRD<'a> {
         RRD { path: path.into() }
     }
 
-    pub fn init_file(self, archives: &[ArchiveSpec], method: Aggregation) -> Result<(), Error> {
+    pub fn init_file(self, archives: &[ArchiveSpec], method: Aggregation) -> Result<(), RRDError> {
         let mut fd = File::create(self.path.as_ref())?;
 
         let mut total_size: u64 = 0;
@@ -106,10 +152,10 @@ impl<'a> RRD<'a> {
 
         total_size += point_size as u64;
         fd.set_len(total_size).unwrap();
-        fd.flush()
+        fd.flush().map_err(|e| RRDError::Io(e))
     }
 
-    fn read_header(&self) -> Result<Header, Error> {
+    fn read_header(&self) -> Result<Header, RRDError> {
         let mut fd = File::open(self.path.as_ref())?;
         let meta: Meta = unsafe { from_bytes(&mut fd) };
         let mut archives: Vec<ArchiveInfo> = Vec::with_capacity(meta.num_of_archives as usize);
@@ -125,52 +171,54 @@ impl<'a> RRD<'a> {
         })
     }
 
-    fn add_point(&mut self, dp: DataPoint) -> Result<(), Error> {
+    fn add_point(&mut self, dp: DataPoint) -> Result<(), RRDError> {
+        let now = unix_time();
+        if dp.time > now {
+            return Err(RRDError::InvalidDataPoint(dp));
+        }
+
+        let header = self.read_header()?;
+        let delta = now - dp.time;
+        let mut related_archives = header.archives
+            .iter()
+            .filter(|e| e.secs_per_point * e.num_of_points > delta as u32);
+
+        let mut high = related_archives.next();
+        if high.is_none() {
+            return Ok(());
+        }
+
+        let archive = high.unwrap();
+
         let mut fd = OpenOptions::new().write(true)
             .read(true)
             .create(false)
             .open(self.path.as_ref())?;
 
-        let header = self.read_header()?;
+        fd.seek(SeekFrom::Start(archive.offset as u64))?;
+        let last: DataPoint = unsafe { from_bytes(&mut fd) };
 
-        let meta_size = mem::size_of::<Meta>();
+        let current = DataPoint {
+            time: dp.time - (dp.time % archive.secs_per_point as u64),
+            value: dp.value,
+        };
 
-        for (i, archive) in header.archives.iter().enumerate() {
+        // this is the fist datapoint
+        if last.time == 0 {
+            let bytes = unsafe { as_bytes(&current) };
+
             fd.seek(SeekFrom::Start(archive.offset as u64))?;
-            let last: DataPoint = unsafe { from_bytes(&mut fd) };
-            let current = DataPoint {
-                time: dp.time - (dp.time % archive.secs_per_point as u64),
-                value: dp.value,
-            };
+            fd.write(bytes)?;
+        } else {
+            let skiped_num = (current.time - last.time) / archive.secs_per_point as u64;
+            let skiped_offset = skiped_num * mem::size_of::<DataPoint>() as u64;
+            let new_offset = archive.offset as u64 +
+                             skiped_offset as u64 %
+                             (archive.num_of_points as u64 * mem::size_of::<DataPoint>() as u64);
+            let bytes = unsafe { as_bytes(&current) };
 
-            // this is the fist datapoint
-            if last.time == 0 {
-                fd.seek(SeekFrom::Start(archive.offset as u64))?;
-                let bytes = unsafe { as_bytes(&current) };
-                fd.write(bytes)?;
-            } else {
-                let skiped_num = (current.time - last.time) / archive.secs_per_point as u64;
-                let skiped_offset = skiped_num * mem::size_of::<DataPoint>() as u64;
-                let new_offset = archive.offset as u64 +
-                                 skiped_offset as u64 %
-                                 (archive.num_of_points as u64 *
-                                  mem::size_of::<DataPoint>() as u64);
-                fd.seek(SeekFrom::Start(new_offset as u64))?;
-                let bytes = unsafe { as_bytes(&current) };
-                fd.write(bytes)?;
-
-                let archive_offset = meta_size as u64 +
-                                     i as u64 * mem::size_of::<ArchiveInfo>() as u64;
-                fd.seek(SeekFrom::Start(archive_offset))?;
-                let bytes = unsafe {
-                    as_bytes(&ArchiveInfo {
-                        num_of_points: archive.num_of_points,
-                        secs_per_point: archive.secs_per_point,
-                        offset: new_offset as usize,
-                    })
-                };
-                fd.write(bytes)?;
-            }
+            fd.seek(SeekFrom::Start(new_offset as u64))?;
+            fd.write(bytes)?;
         }
 
         fd.flush()?;
