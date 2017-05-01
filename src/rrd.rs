@@ -20,13 +20,19 @@ impl fmt::Display for DataPoint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum Aggregation {
     Avg,
     Max,
     Min,
     Sum,
     Last,
+}
+
+fn aggreate(values: Vec<f64>, method: Aggregation) -> f64 {
+    let num = values.len() as f64;
+    let sum = values.iter().fold(0.0, |acc, &x| acc +x);
+    sum / num
 }
 
 #[derive(Debug)]
@@ -57,13 +63,14 @@ pub struct ArchiveInfo {
     offset: usize,
 }
 
+#[derive(Debug)]
 struct Header {
     meta: Meta,
     archives: Vec<ArchiveInfo>,
 }
 
 #[derive(Debug)]
-enum RRDError {
+pub enum RRDError {
     Io(Error),
     InvalidDataPoint(DataPoint),
 }
@@ -98,7 +105,6 @@ impl From<Error> for RRDError {
         RRDError::Io(err)
     }
 }
-
 
 pub struct RRD<'a> {
     path: Cow<'a, str>,
@@ -169,15 +175,102 @@ impl<'a> RRD<'a> {
             archives: archives,
         })
     }
+    fn add_point_to_archive(dp: DataPoint, fd: &mut File, archive: &ArchiveInfo) -> Result<(), RRDError> {
+        fd.seek(SeekFrom::Start(archive.offset as u64))?;
+        let first: DataPoint = unsafe { from_bytes(fd) };
 
-    fn add_point(&mut self, dp: DataPoint) -> Result<(), RRDError> {
-        // refuse to add the datapoint if it's in the future
+        // align this datapoint by high archive specs
+        let dp = DataPoint {
+            time: dp.time - (dp.time % archive.secs_per_point as u64),
+            value: dp.value,
+        };
+
+        // find the offset to add this datapoint
+        let offset = if first.time == 0 {
+            archive.offset as u64
+        } else {
+            let dp_size = mem::size_of::<DataPoint>() as i64;
+            let archive_size = archive.num_of_points as i64 * dp_size;
+            let skiped_num = (dp.time as i64 - first.time as i64) / archive.secs_per_point as i64;
+            let skiped_offset = skiped_num * dp_size as i64;
+            let inner_offset = sane_modulo(skiped_offset as i64, archive_size);
+
+            archive.offset as u64 + inner_offset as u64
+        };
+
+        let bytes = unsafe { as_bytes(&dp) };
+        fd.seek(SeekFrom::Start(offset))?;
+        fd.write(bytes)?;
+        Ok(())
+    }
+
+    fn find_neighbours(dp: DataPoint, high: &ArchiveInfo, low: &&ArchiveInfo, fd: &mut File) -> Result<Vec<DataPoint>, RRDError> {
+            fd.seek(SeekFrom::Start(high.offset as u64))?;
+
+            let first: DataPoint = unsafe { from_bytes(fd) };
+            let dp_size = mem::size_of::<DataPoint>() as u64;
+            let interval = low.secs_per_point as u64;
+
+            let left = dp.time - dp.time % interval;
+            let right = left + interval;
+            let l_offset = {
+                let inner_offset = sane_modulo((left as i64 - first.time as i64)/ high.secs_per_point as i64 * dp_size as i64 ,
+                            (high.num_of_points as u64 * dp_size) as i64);
+                (high.offset as i64  + inner_offset) as u64
+            };
+
+            let r_offset = {
+                let inner_offset = sane_modulo((right as i64 - first.time as i64)/ high.secs_per_point as i64 * dp_size as i64 ,
+                            (high.num_of_points as u64 * dp_size) as i64);
+                (high.offset as i64 + inner_offset) as u64
+            };
+
+            let mut high_values: Vec<DataPoint> = vec![];
+            if l_offset < r_offset {
+                let size = (r_offset - l_offset) as usize / mem::size_of::<u8>();
+                let mut buf : Vec<u8> = vec![0u8; size];
+                fd.seek(SeekFrom::Start(l_offset))?;
+                fd.read_exact(&mut buf)?;
+                let datapoints : &[DataPoint] = unsafe {
+                    buf.as_slice();
+                    slice::from_raw_parts(buf.as_slice().as_ptr() as *const DataPoint, size / mem::size_of::<DataPoint>())
+                };
+                high_values.extend_from_slice(datapoints);
+            } else {
+                let archive_size = high.num_of_points as u64 * dp_size;
+
+                let l_size = archive_size as usize + high.offset as usize - l_offset as usize;
+                let mut buf: Vec<u8> = vec![0u8; l_size];
+                fd.seek(SeekFrom::Start(l_offset))?;
+                fd.read_exact(&mut buf)?;
+                let datapoints : &[DataPoint] = unsafe {
+                    buf.as_slice();
+                    slice::from_raw_parts(buf.as_slice().as_ptr() as *const DataPoint, l_size / mem::size_of::<DataPoint>())
+                };
+                high_values.extend_from_slice(datapoints);
+
+                let r_size = r_offset as usize - high.offset as usize;
+                let mut buf: Vec<u8> = vec![0u8; r_size];
+                fd.seek(SeekFrom::Start(high.offset as u64))?;
+                fd.read_exact(&mut buf)?;
+                let datapoints : &[DataPoint] = unsafe {
+                    buf.as_slice();
+                    slice::from_raw_parts(buf.as_slice().as_ptr() as *const DataPoint, r_size / mem::size_of::<DataPoint>())
+                };
+                high_values.extend_from_slice(datapoints);
+            }
+
+            Ok(high_values)
+    }
+
+    pub fn add_point(&mut self, dp: DataPoint) -> Result<(), RRDError> {
+        // refuse to add this datapoint if it's in the future
         let now = unix_time();
         if dp.time > now {
             return Err(RRDError::InvalidDataPoint(dp));
         }
 
-        // find all archives which covers the datapoint
+        // find all archives which covers this datapoint
         let mut fd = OpenOptions::new().write(true)
             .read(true)
             .create(false)
@@ -185,51 +278,51 @@ impl<'a> RRD<'a> {
 
         let header = self.read_header(&mut fd)?;
         let delta = now - dp.time;
-        let mut related_archives = header.archives
+        let related_archives: Vec<_> = header.archives
             .iter()
-            .filter(|e| e.secs_per_point * e.num_of_points > delta as u32);
+            .filter(|e| e.secs_per_point * e.num_of_points > delta as u32)
+            .collect();
 
-        // archives are sorted, the fist has highest precision
-        let mut high = related_archives.next();
-        if high.is_none() {
+        // archives are sorted, so the fist has highest precision
+        if related_archives.is_empty() {
             return Ok(());
         }
+        let high = related_archives[0];
 
-        let archive = high.unwrap();
-
-
-        fd.seek(SeekFrom::Start(archive.offset as u64))?;
-        let first: DataPoint = unsafe { from_bytes(&mut fd) };
-
-
-        // align dp's time
+        // align this datapoint by high archive specs
         let dp = DataPoint {
-            time: dp.time - (dp.time % archive.secs_per_point as u64),
+            time: dp.time - (dp.time % high.secs_per_point as u64),
             value: dp.value,
         };
 
-        // this is the fist datapoint
-        if first.time == 0 {
-            let bytes = unsafe { as_bytes(&dp) };
+        Self::add_point_to_archive(dp, &mut fd, high)?;
 
-            fd.seek(SeekFrom::Start(archive.offset as u64))?;
-            fd.write(bytes)?;
-        } else {
-            let skiped_num = (dp.time - first.time) / archive.secs_per_point as u64;
-            let skiped_offset = skiped_num * mem::size_of::<DataPoint>() as u64;
-            let new_offset = archive.offset as u64 +
-                             skiped_offset as u64 %
-                             (archive.num_of_points as u64 * mem::size_of::<DataPoint>() as u64);
-            let bytes = unsafe { as_bytes(&dp) };
+        for low in related_archives.as_slice()[1..].iter() {
 
-            fd.seek(SeekFrom::Start(new_offset as u64))?;
-            fd.write(bytes)?;
+            let neighbours =  Self::find_neighbours(dp, high, low, &mut fd)?;
+            let neighbours_num = neighbours.len();
+            let valid_values: Vec<f64> = neighbours.into_iter().filter(|e| e.time !=0 ).map(|e| e.value).collect();
+
+            let xfill = valid_values.len() as f64 / neighbours_num as f64;
+            if xfill >= 0.5 {
+                let method = header.meta.aggregation_method;
+                let aggreated_value = aggreate(valid_values, method);
+                let interval = low.secs_per_point as u64;
+
+                let dp = DataPoint {
+                    time: dp.time - dp.time % interval,
+                    value: aggreated_value,
+                };
+
+                Self::add_point_to_archive(dp, &mut fd, low)?;
+            }
         }
 
         fd.flush()?;
         Ok(())
     }
 }
+
 
 unsafe fn as_bytes<'a, T>(val: &T) -> &'a [u8] {
     slice::from_raw_parts(val as *const T as *const u8, mem::size_of::<T>())
@@ -244,20 +337,39 @@ unsafe fn from_bytes<T>(reader: &mut File) -> T {
     val
 }
 
+fn sane_modulo(a: i64, n: i64) -> i64 {
+    let m = a % n;
+
+    if m == 0 {
+        0
+    } else if (a > 0 && n > 0) || (a < 0 && n < 0) {
+        m
+    } else if (a < 0 && n > 0) || (a > 0 && n < 0) {
+        m + n
+    } else {
+        0
+    }
+}
+
 #[test]
 fn test_read_write_file() {
     let rrd = RRD::new("/tmp/example.rrd");
     let result = rrd.init_file(&[ArchiveSpec {
                                      secs_per_point: 60,
                                      num_of_points: 86400 * 1 / 60,
+                                 },
+                                 ArchiveSpec {
+                                     secs_per_point: 60 * 5,
+                                     num_of_points: 288 * 7,
                                  }],
                                Aggregation::Avg);
     assert!(result.is_ok());
 
     let mut rrd = RRD::new("/tmp/example.rrd");
-    for i in 0..60 {
+    let now = unix_time();
+    for i in 0..60 * 24 {
         let result = rrd.add_point(DataPoint {
-            time: unix_time() - i * 60,
+            time: now - i * 60,
             value: 12.3,
         });
         assert!(result.is_ok());
