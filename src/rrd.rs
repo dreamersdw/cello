@@ -30,9 +30,31 @@ pub enum Aggregation {
 }
 
 fn aggreate(values: Vec<f64>, method: Aggregation) -> f64 {
-    let num = values.len() as f64;
-    let sum = values.iter().fold(0.0, |acc, &x| acc +x);
-    sum / num
+    match method {
+        Aggregation::Avg => {
+            let num = values.len() as f64;
+            let sum = values.iter().cloned().fold(0.0, |acc, x| acc + x);
+            sum / num
+        },
+        Aggregation::Max => {
+            let neg_inf = -1./0.;
+            values.iter().cloned().fold(neg_inf, f64::max)
+        },
+        Aggregation::Min => {
+            let pos_inf = 1./0.;
+            values.iter().cloned().fold(pos_inf, f64::min)
+        },
+        Aggregation::Sum => {
+            values.iter().sum()
+        },
+        Aggregation::Last => {
+            let last = values.last();
+            match last {
+                Some(&x) => x,
+                None => 0.0,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
