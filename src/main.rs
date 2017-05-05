@@ -9,4 +9,5 @@ fn main() {
                                      num_of_points: 86400 * 1 / 60,
                                  }],
                                Aggregation::Avg);
+    result.unwrap();
 }

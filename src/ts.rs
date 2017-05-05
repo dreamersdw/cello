@@ -23,10 +23,12 @@ impl<'a> TSMap<'a> {
         where S: Into<Cow<'a, str>>
     {
         let ckey = key.into();
-        let mut ts = self.map.entry(ckey.clone()).or_insert(TS {
-            key: ckey.clone(),
-            points: vec![],
-        });
+        let mut ts = self.map
+            .entry(ckey.clone())
+            .or_insert(TS {
+                           key: ckey.clone(),
+                           points: vec![],
+                       });
 
         ts.add_point(dp);
     }
@@ -37,11 +39,11 @@ impl<'a> TSMap<'a> {
         self.map
             .get(&key.into())
             .map(|ts| {
-                ts.points
-                    .iter()
-                    .take_while(|x| x.time >= start && x.time <= end)
-                    .collect()
-            })
+                     ts.points
+                         .iter()
+                         .take_while(|x| x.time >= start && x.time <= end)
+                         .collect()
+                 })
 
     }
 }
@@ -56,10 +58,7 @@ impl<'a> IntoIterator for TS<'a> {
     type Item = DataPoint;
     type IntoIter = TsIntoIterator<'a>;
     fn into_iter(self) -> Self::IntoIter {
-        TsIntoIterator {
-            ts: self,
-            index: 0,
-        }
+        TsIntoIterator { ts: self, index: 0 }
     }
 }
 
