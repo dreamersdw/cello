@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, remove_file};
 use std::io::{Read, Write, Error, Seek, SeekFrom};
+use std::path;
 use std::iter::Iterator;
 use std::mem;
 use std::fmt;
@@ -472,11 +473,12 @@ impl<'a> RRD<'a> {
 
         let mut fd = File::open(self.path.as_ref())?;
         let header = self.read_header(&mut fd)?;
-        let max_rentention = header.meta.max_rentention;
+        let max_rentention = header.meta.max_rentention as u64;
 
         let now = self.timer.get_time();
         let end = if now < end { now } else { end };
-        let start = if start < now - max_rentention as u64 {
+
+        let start = if start + max_rentention < now {
             now - max_rentention as u64
         } else {
             start
@@ -550,37 +552,63 @@ unsafe fn from_file<T>(reader: &mut File) -> T {
     val
 }
 
+
+fn create_rrd() {
+    let rrd = RRD::debug_new("/tmp/example.rrd");
+    rrd.init_file(&[ArchiveSpec {
+                        secs_per_point: 60,
+                        num_of_points: 86400 / 60,
+                    },
+                    ArchiveSpec {
+                        secs_per_point: 60 * 5,
+                        num_of_points: 288 * 7,
+                    }],
+                    Aggregation::Avg)
+                    .expect("failed to init rrd file");
+}
+
+fn remove_rrd() {
+    let path = "/tmp/example.rrd";
+    if path::Path::new(path).exists() {
+        remove_file(path).expect("rrd file not exists");
+    }
+}
+
 #[test]
 fn test_struct() {
     assert_eq!(DataPoint::size(), 16);
     assert_eq!(Meta::size(), 16);
 }
 
-#[test]
-fn test_read_write_file() {
-    let rrd = RRD::new("/tmp/example.rrd");
-    let result = rrd.init_file(&[ArchiveSpec {
-                                     secs_per_point: 60,
-                                     num_of_points: 86400 * 1 / 60,
-                                 },
-                                 ArchiveSpec {
-                                     secs_per_point: 60 * 5,
-                                     num_of_points: 288 * 7,
-                                 }],
-                               Aggregation::Avg);
-    assert!(result.is_ok());
+fn with_setup<F>(setup: &Fn()->(), teardown: &Fn()->(), test: F)
+                where F: Fn() -> ()
+ {
+    setup();
+    test();
+    teardown();
+}
 
-    let mut rrd = RRD::new("/tmp/example.rrd");
-    let now = unix_time();
-    for i in 0..5 {
-        let dp = DataPoint {
-            time: now - i * 60,
-            value: i as f64,
-        };
-        let result = rrd.add_point(dp);
+#[test]
+fn test_add_point() {
+    with_setup(&create_rrd, &remove_rrd, || {
+        let mut rrd = RRD::debug_new("/tmp/example.rrd");
+        rrd.timer.set_time(0);
+
+        for i in 0..5 {
+            let dp = DataPoint {
+                time: rrd.timer.get_time(),
+                value: i as i64 as f64,
+            };
+
+            let result = rrd.add_point(dp);
+            assert!(result.is_ok());
+
+            rrd.timer.add_time(60);
+        }
+        let result = rrd.read_points(0, 300);
         assert!(result.is_ok());
-    }
-    let result = rrd.read_points(now - 2000 - 3600 * 24, now);
-    print!("result: {:?}", result);
-    // assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(result.unwrap().len(), 5);
+        }
+    );
+
 }
