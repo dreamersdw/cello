@@ -509,7 +509,7 @@ impl<'a> RRD<'a> {
         let valid = datapoints
             .iter()
             .cloned()
-            .filter(|dp| s as u64 <= dp.time && dp.time <= e as u64)
+            .filter(|dp| dp.time !=0 && s as u64 <= dp.time && dp.time <= e as u64)
             .collect();
         Ok(valid)
     }
@@ -592,7 +592,7 @@ fn with_setup<F>(setup: &Fn()->(), teardown: &Fn()->(), test: F)
 fn test_add_point() {
     with_setup(&create_rrd, &remove_rrd, || {
         let mut rrd = RRD::debug_new("/tmp/example.rrd");
-        rrd.timer.set_time(0);
+        rrd.timer.set_time(86400);
 
         for i in 0..5 {
             let dp = DataPoint {
@@ -605,10 +605,15 @@ fn test_add_point() {
 
             rrd.timer.add_time(60);
         }
-        let result = rrd.read_points(0, 300);
+        let result = rrd.read_points(86400, 86400 + 300);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 5);
-        }
-    );
 
+        let result = rrd.read_points(0, 86700);
+        assert!(result.is_ok());
+        
+        let datapoints = result.unwrap();
+        assert_eq!(datapoints.len(), 1);
+        assert_eq!(datapoints[0].value, 2.0);
+    });
 }
