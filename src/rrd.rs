@@ -510,7 +510,9 @@ impl<'a> RRD<'a> {
         let valid = datapoints
             .iter()
             .cloned()
-            .filter(|dp| dp.time !=0 && s as u64 <= dp.time && dp.time <= e as u64)
+            .filter(|dp| dp.time !=0
+                            && s as u64 <= dp.time
+                            && dp.time <= e as u64)
             .collect();
         Ok(valid)
     }
