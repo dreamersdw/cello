@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Error, Seek, SeekFrom};
@@ -212,7 +214,7 @@ impl ArchiveInfo {
 
         let bytes = dp.encode();
         fd.seek(SeekFrom::Start(offset))?;
-        fd.write(bytes)?;
+        fd.write_all(bytes)?;
         Ok(())
     }
 }
@@ -292,7 +294,7 @@ impl<'a> RRD<'a> {
         };
 
         let bytes = meta.encode();
-        fd.write(bytes)?;
+        fd.write_all(bytes)?;
         let  meta_size = bytes.len();
 
         // write archive info
@@ -305,7 +307,7 @@ impl<'a> RRD<'a> {
                 offset: offset,
             };
             let archive_bytes = archive_info.encode();
-            fd.write(archive_bytes)?;
+            fd.write_all(archive_bytes)?;
             total_size += archive_bytes.len() as u64;
 
             offset += spec.num_of_points as usize * mem::size_of::<DataPoint>();
@@ -323,7 +325,7 @@ impl<'a> RRD<'a> {
                       point_size as u64;
 
         fd.set_len(total_size).unwrap();
-        fd.flush().map_err(|e| RRDError::Io(e))
+        fd.flush().map_err(RRDError::Io)
     }
 
     fn read_header(&self, fd: &mut File) -> Result<Header, RRDError> {
@@ -482,8 +484,10 @@ fn sane_modulo(a: i64, n: i64) -> i64 {
     let m = a % n;
 
     if m == 0 {
-        0
-    } else if (a > 0 && n > 0) || (a < 0 && n < 0) {
+        return 0
+    }
+
+    if (a > 0 && n > 0) || (a < 0 && n < 0) {
         m
     } else if (a < 0 && n > 0) || (a > 0 && n < 0) {
         m + n
