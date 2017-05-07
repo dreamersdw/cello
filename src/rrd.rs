@@ -266,15 +266,55 @@ impl From<Error> for RRDError {
     }
 }
 
+trait Timer {
+    fn get_time(&self) -> u64;
+    fn set_time(&mut self, timestamp: u64);
+    fn add_time(&mut self, delta: i64) {
+        let t0 = self.get_time() as i64;
+        let t1 =  t0 + delta;
+        self.set_time(t1 as u64);
+    }
+}
+
+struct SystemTimer {}
+
+impl Timer for SystemTimer {
+    fn get_time(&self) -> u64 {
+        unix_time()
+    }
+    fn set_time(&mut self, _: u64) {
+    }
+}
+
+struct ManulTimer {
+    time: u64
+}
+
+impl Timer for ManulTimer {
+    fn get_time(&self) -> u64 {
+        self.time
+    }
+    fn set_time(&mut self, t: u64) {
+        self.time = t;
+    }
+}
+
 pub struct RRD<'a> {
     path: Cow<'a, str>,
+    timer: Box<Timer>,
 }
 
 impl<'a> RRD<'a> {
     pub fn new<S>(path: S) -> RRD<'a>
         where S: Into<Cow<'a, str>>
     {
-        RRD { path: path.into() }
+        RRD { path: path.into(), timer: Box::new(SystemTimer{}) }
+    }
+
+    fn debug_new<S>(path: S) -> RRD<'a>
+        where S: Into<Cow<'a, str>>
+    {
+        RRD { path: path.into(), timer: Box::new(ManulTimer{time:0}) }
     }
 
     pub fn init_file(self, archives: &[ArchiveSpec], method: Aggregation) 
@@ -359,7 +399,7 @@ impl<'a> RRD<'a> {
 
     pub fn add_point(&mut self, dp: DataPoint) -> Result<(), RRDError> {
         // refuse to add this datapoint if it's in the future
-        let now = unix_time();
+        let now = self.timer.get_time();
         if dp.time > now {
             return Err(RRDError::InvalidDataPoint(dp));
         }
@@ -434,7 +474,7 @@ impl<'a> RRD<'a> {
         let header = self.read_header(&mut fd)?;
         let max_rentention = header.meta.max_rentention;
 
-        let now = unix_time();
+        let now = self.timer.get_time();
         let end = if now < end { now } else { end };
         let start = if start < now - max_rentention as u64 {
             now - max_rentention as u64
