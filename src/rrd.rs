@@ -10,6 +10,7 @@ use std::fmt;
 use std::error;
 use std::slice;
 use std::time;
+use std::panic::{UnwindSafe, catch_unwind, resume_unwind};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataPoint {
@@ -581,11 +582,16 @@ fn test_struct() {
 }
 
 fn with_setup<F>(setup: &Fn()->(), teardown: &Fn()->(), test: F)
-                where F: Fn() -> ()
+                where F: Fn() -> () + UnwindSafe
  {
     setup();
-    test();
+    let result = catch_unwind(move || {
+        test()
+    });
     teardown();
+    if let Err(err) = result {
+        resume_unwind(err);
+    }
 }
 
 #[test]
